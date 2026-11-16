@@ -1,0 +1,291 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "py/runtime.h"
+#include "py/mphal.h"
+#include "py/mperrno.h"
+#include "modmachine.h"
+#include "rpi.h"
+#include "bcm283x_gpio.h"
+#include "bcm283x_pwm.h"
+#include "pwm.h"
+#include "machine_pin_util.h"
+
+#define DEFAULT_PERIOD  960
+#define DEFAULT_TICK_HZ 960000
+#define DEFAULT_TIMEOUT 1000
+
+typedef struct _machine_pwm_obj_t {
+    const mp_obj_base_t base;
+    const uint32_t id;
+    int32_t pin;
+    uint32_t tick_hz;
+} machine_pwm_obj_t;
+
+static machine_pwm_obj_t machine_pwm_obj[] = {
+    {{&machine_pwm_type}, 0, -1, 0},
+    {{&machine_pwm_type}, 1, -1, 0},
+};
+
+static int pwm_select_pin(const int pin) {
+    static const int pwm_alt[3][9] = {
+        {12, 13, 18, 19, 40, 41, 45, 52, 53},
+        { 0,  1,  0,  1,  0,  1,  1,  0,  1},
+        { GPF_ALT_0, GPF_ALT_0, GPF_ALT_5, GPF_ALT_5, \
+          GPF_ALT_0, GPF_ALT_0, GPF_ALT_0, GPF_ALT_1, GPF_ALT_1}
+    };
+    int i;
+    for(i = 0; i < 9; i++) {
+        if (pwm_alt[0][i] == pin) {
+            break;
+        }
+    }
+    if (i < 9) {
+        gpio_set_mode(pin, pwm_alt[2][i]);
+        return pwm_alt[1][i];
+    } else {
+        return -1;
+    }
+}
+
+static void mp_machine_pwm_init_helper(machine_pwm_obj_t *self, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_tick_hz, ARG_period, ARG_duty_ticks, ARG_freq, ARG_duty_u16, ARG_active, ARG_ms, ARG_mode, ARG_polarity, ARG_silence, ARG_use_fifo, ARG_fifo_repeat };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_tick_hz,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_period,      MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_duty_ticks,  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_freq,        MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_duty_u16,    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_active,      MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 1} },
+        { MP_QSTR_ms,          MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_mode,        MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_polarity,    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_silence,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_use_fifo,    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_fifo_repeat, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+
+    // parse args
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    // initialize PWM controller
+    uint32_t old;
+    old = pwm_get_ctl(self->id);
+    uint32_t flags = 0;
+
+    switch(args[ARG_active].u_int){
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_PWEN1;
+        break;
+    default:
+        flags |= old & CTL_PWEN1;
+    }
+
+    switch (args[ARG_ms].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_MSEN1;
+        break;
+    default:
+        flags |= old & CTL_MSEN1;
+    }
+    switch (args[ARG_mode].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_MODE1;
+        break;
+    default:
+        flags |= old & CTL_MODE1;
+    }
+    switch (args[ARG_polarity].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_POLA1;
+        break;
+    default:
+        flags |= old & CTL_POLA1;
+    }
+    switch (args[ARG_silence].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_SBIT1;
+        break;
+    default:
+        flags |= old & CTL_SBIT1;
+    }
+    switch (args[ARG_use_fifo].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_USEF1;
+        break;
+    default:
+        flags |= old & CTL_USEF1;
+    }
+    switch (args[ARG_fifo_repeat].u_int) {
+    case 0:
+        break;
+    case 1:
+        flags |= CTL_RPTL1;
+        break;
+    default:
+        flags |= old & CTL_RPTL1;
+    }
+    pwm_set_ctl(self->id, flags);
+
+    pwm_err_clear();
+
+    // set the instance property tick_hz
+    if (args[ARG_tick_hz].u_int > 0) {
+        self->tick_hz = args[ARG_tick_hz].u_int;
+    } else if ((args[ARG_freq].u_int > 0) && (args[ARG_period].u_int > 0)){
+        self->tick_hz = args[ARG_freq].u_int * args[ARG_period].u_int;
+    } else {
+        self->tick_hz = DEFAULT_TICK_HZ;
+    }
+
+    // set period and duty_ticks
+    uint32_t period;
+    uint64_t duty_ticks;
+
+    if (args[ARG_period].u_int > 0) {
+        period = args[ARG_period].u_int;
+    } else if (args[ARG_freq].u_int > 0) {
+        period = self->tick_hz / args[ARG_freq].u_int;
+    } else {
+        period = DEFAULT_PERIOD;
+    }
+    pwm_set_period(self->id, period);
+
+    if (args[ARG_duty_ticks].u_int > 0) {
+        duty_ticks = args[ARG_duty_ticks].u_int;
+    } else if (args[ARG_duty_u16].u_int > 0) {
+        duty_ticks = (self->tick_hz * args[ARG_duty_u16].u_int) >> 16;
+    } else {
+        duty_ticks = period >> 1;
+    }
+    pwm_set_duty_ticks(self->id, duty_ticks & 0xffffffff);
+}
+
+static mp_obj_t mp_machine_pwm_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+    mp_arg_check_num(n_args, n_kw, 1, MP_OBJ_FUN_ARGS_MAX, true);
+
+    // first argment is PWM number or Pin object
+    int id = -1;
+    int pin_num = -1;
+    // set up GPIO alternate function and get PWM id if the pin is specified
+    if (mp_obj_get_type(all_args[0]) == &machine_pin_type) {
+        pin_num = pin_get_id(all_args[0]);
+        if (pin_num < 0) {
+            mp_raise_ValueError("invalid pin");
+        } else {
+            id = pwm_select_pin(pin_num);
+            if (id < 0) {
+                mp_raise_ValueError("invalid pin");
+            }
+        }
+    // or use PWM id without specifing GPIO pin (pin_num = -1)
+    } else if (MP_OBJ_IS_INT(all_args[0])) {
+        id = mp_obj_get_int(all_args[0]);
+        if ((id < 0) || (id > 1)) {
+            mp_raise_ValueError("invalid PWM number");
+        }
+    }
+
+    machine_pwm_obj_t *self = (machine_pwm_obj_t*) &machine_pwm_obj[id];
+    self->pin = pin_num;
+
+    // parse keyword arguments
+    mp_map_t kw_args;
+    mp_map_init_fixed_table(&kw_args, n_kw, all_args + n_args);
+    mp_machine_pwm_init_helper(self, n_args - 1, all_args + 1, &kw_args);
+
+    return self;
+}
+
+static void mp_machine_pwm_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
+    machine_pwm_obj_t *self = self_in;
+    mp_printf(print, "PWM(");
+    if (self->pin >= 0) {
+        mp_printf(print, "Pin(%u)", self->pin);
+    } else {
+        mp_printf(print, "%u", self->id);
+    }
+
+    mp_printf(print, ", tick_hz=%u", self->tick_hz);
+    mp_printf(print, ", period=%u", pwm_get_period(self->id));
+    mp_printf(print, ", duty_ticks=%u", pwm_get_duty_ticks(self->id));
+
+    uint32_t flags = pwm_get_ctl(self->id);
+    if (flags & CTL_PWEN1) {
+        mp_printf(print, ", active=True");
+    } else {
+        mp_printf(print, ", active=False");
+    }
+    qstr mode_qstr = MP_QSTR_MS_DISABLE;
+    if (flags & CTL_MSEN1) {
+        mode_qstr = MP_QSTR_MS_ENABLE;
+    }
+    mp_printf(print, ", ms=PWM.%s", qstr_str(mode_qstr));
+
+    mode_qstr = MP_QSTR_MODE_PWM;
+    if (flags & CTL_MODE1) {
+        mode_qstr = MP_QSTR_MODE_SERIALIZER;
+    }
+    mp_printf(print, ", mode=PWM.%s", qstr_str(mode_qstr));
+    mp_printf(print, ", polarity=%u", (flags & CTL_POLA1) ? 1 : 0);
+    mp_printf(print, ", silence=%u", (flags & CTL_SBIT1) ? 1 : 0);
+    mp_printf(print, ", use_fifo=%u", (flags & CTL_USEF1) ? 1 : 0);
+    mp_printf(print, ", fifo_repeat=%u)", (flags & CTL_RPTL1) ? 1 : 0);
+}
+
+static void set_active(machine_pwm_obj_t *self, bool set_pin) {
+    uint32_t flags = pwm_get_ctl(self->id);
+    if (!(flags & CTL_PWEN1)) {
+        pwm_set_active(self->id, true);
+    }
+}
+
+static void mp_machine_pwm_deinit(machine_pwm_obj_t *self) {
+    pwm_set_active(self->id, false);
+    self->pin = -1;
+    self->tick_hz = 0;
+}
+
+static mp_obj_t mp_machine_pwm_duty_get_u16(machine_pwm_obj_t *self) {
+    uint64_t duty = pwm_get_duty_ticks(self->id) << 16;
+    return MP_OBJ_NEW_SMALL_INT(duty / pwm_get_period(self->id));
+}
+
+static void mp_machine_pwm_duty_set_u16(machine_pwm_obj_t *self, mp_int_t duty) {
+    uint64_t period = pwm_get_period(self->id);
+    duty = period * duty;
+    pwm_set_duty_ticks(self->id, (duty >> 16) & 0xffffffffU);
+}
+
+static mp_obj_t mp_machine_pwm_freq_get(machine_pwm_obj_t *self) {
+    return MP_OBJ_NEW_SMALL_INT(self->tick_hz / pwm_get_period(self->id));
+}
+
+static void mp_machine_pwm_freq_set(machine_pwm_obj_t *self, mp_int_t freq) {
+    uint32_t period = self->tick_hz / freq;
+    uint64_t duty = pwm_get_duty_ticks(self->id);
+    duty = (duty << 32) / pwm_get_period(self->id) * period;
+    pwm_set_duty_ticks(self->id, (duty >> 32) & 0xffffffffU);
+    pwm_set_period(self->id, period);
+}
+
+static mp_obj_t mp_machine_pwm_duty_get_ns(machine_pwm_obj_t *self) {
+    return MP_OBJ_NEW_SMALL_INT(0);
+}
+
+static void mp_machine_pwm_duty_set_ns(machine_pwm_obj_t *self, mp_int_t duty) {
+}
