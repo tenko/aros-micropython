@@ -1,0 +1,10 @@
+--- micropython-1.29.0/extmod/vfs_posix_file.c	2026-08-24 15:44:05.000000000 +0200
++++ ../micropython-1.29.0/extmod/vfs_posix_file.c	2026-10-23 23:41:03.573151691 +0200
+@@ -37,6 +37,7 @@
+ 
+ #ifdef _WIN32
+ #define fsync _commit
++#elif defined(__AROS__)
+ #else
+ #include <poll.h>
+ #endif
